@@ -107,7 +107,7 @@ These rates apply per pair of pods sharing a node ID, not across the entire flee
 
 The Kubernetes Downward API injects the pod UID and pod name into environment variables. No init containers, sidecars, additional volumes, or ServiceAccounts are required.
 
-The platform Helm chart already provides these. The relevant snippet from the deployment template:
+Using a sample Helm chart from the deployment template:
 
 ```yaml
 env:
@@ -121,9 +121,9 @@ env:
         fieldPath: metadata.uid
 ```
 
-`CONTAINER_ID` is a platform naming convention; the underlying value is `metadata.uid` — the Kubernetes-assigned pod UID, not a container identifier.
+`CONTAINER_ID` is a naming convention; the underlying value is `metadata.uid` — the Kubernetes-assigned pod UID, not a container identifier.
 
-A complete Deployment manifest:
+A Sample Deployment manifest:
 
 ```yaml
 apiVersion: apps/v1
