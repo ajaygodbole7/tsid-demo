@@ -9,7 +9,7 @@ Most Java services run pods through one of two controllers:
 - **Deployment.** Creates interchangeable pods. The common default for stateless services. Pod names include random suffixes — `orders-7d8c9bfb59-abc12` — and are not stable identities.
 - **StatefulSet.** Creates pods with stable ordinal identity. A StatefulSet named `orders` creates pods named `orders-0`, `orders-1`, and so on.
 
-AWS EKS workloads use Deployments by default. The rest of this document is structured around that case, with StatefulSet treated as the cleaner alternative when it's available.
+AWS EKS workloads use Deployments by default. The rest of this document is structured around that case, with StatefulSet covered as an alternative where it applies.
 
 ---
 
@@ -19,7 +19,7 @@ TSID reserves 10 bits for a node ID. Every pod that generates IDs needs a unique
 
 The node ID does not need to be permanent. It needs to be unique across pods that may write IDs to the same table or collection at the same time.
 
-The primary operational risk is uncoordinated assignment. If two live pods use the same node ID, they share the same TSID counter space — which creates a chance of duplicate IDs under concurrent writes.
+The primary operational risk is uncoordinated assignment. Two live pods using the same node ID share TSID counter space, which permits duplicate IDs under concurrent writes.
 
 ---
 
@@ -29,11 +29,11 @@ Node IDs only need to be unique among generators writing to the **same** table, 
 
 In a distributed ecommerce system, `orders`, `payments`, and `shipping` microservices each write to their own tables.
 
-In that setup, `orders-3` and `payments-3` can both use node ID `3`. They're not writing IDs into the same destination.
+In that setup, `orders-3` and `payments-3` can both use node ID `3`. They are not writing IDs into the same destination.
 
-That changes if multiple services write into a shared table, collection, event stream, or global namespace. Then node IDs must be unique across all of them.
+That changes when multiple services write into a shared table, collection, event stream, or global namespace. Node IDs must then be unique across all contributing pods.
 
-For shared destinations, don't rely on hashing. Use an explicit assignment scheme.
+For shared destinations, hashing is not reliable. Use an explicit assignment scheme.
 
 A common pattern is to partition the 10-bit field — some bits for service ID, the rest for pod ordinal:
 
@@ -47,31 +47,33 @@ if (serviceId < 0 || serviceId >= 16 || podOrdinal < 0 || podOrdinal >= 64) {
 int nodeId = (serviceId << 6) | podOrdinal;
 ```
 
-The rest of this document covers the much more common case: each service writes to its own tables, so node IDs only need to be unique within a single service's pod fleet.
+The rest of this document covers the common case: each service writes to its own tables, so node IDs only need to be unique within a single service's pod fleet.
 
 ---
 
 ## Recommended Pattern for EKS Deployments: Pod UID Hash + Retry
 
-The approach that works without adding any infrastructure: take the pod UID and hash it down into the 10-bit node space.
+The recommended approach for EKS Deployments: hash the pod UID into the 10-bit node space.
 
-Kubernetes assigns a pod UID to every pod. It's a full 128-bit UUID, regenerated for every new pod including replacements. Hashing it into `[0, 1023]` gives a stable per-pod node ID for the pod's lifetime.
+Kubernetes assigns a pod UID to every pod — a 128-bit UUID regenerated for every new pod, including replacements. Hashing it into `[0, 1023]` produces a stable per-pod node ID for the pod's lifetime.
 
-If two pods happen to hash to the same node ID — which will happen at scale — the database catches the rare collision and the application retries.
+Node ID duplicates are an expected outcome of this approach at scale and are handled by design. When a duplicate produces an actual TSID collision, the database rejects the insert via the primary key constraint, and the application retries with a fresh TSID.
 
-No coordination service. No admission webhook. No DynamoDB. No pre-created Kubernetes objects.
+This requires no coordination service, no admission webhook, and no external state.
 
 ### Why It Works: Collision Math
 
-For two pods to produce the same TSID, three things have to happen at once:
+A duplicate TSID requires three simultaneous conditions, not one:
 
-1. They share a node ID.
-2. They generate in the same millisecond.
-3. Their counters land on the same value within that millisecond.
+1. Two pods share a node ID.
+2. They generate an ID in the same millisecond.
+3. Their per-millisecond counters land on the same value.
 
-The first is a birthday probability — likely at scale. The second and third depend on write rate.
+The first condition depends on pod count and follows a birthday distribution. The second and third depend on write rate. All three must coincide for the database to see a duplicate.
 
-#### Step 1 — How often do two pods get the same node ID?
+#### Step 1 — Pod count and node ID duplication
+
+Node IDs are drawn from a 1,024-slot space by hashing pod UUIDs. The birthday probability of any duplicate across N pods:
 
 | Pods per service | P(duplicate node ID) |
 | ---------------: | -------------------: |
@@ -81,39 +83,31 @@ The first is a birthday probability — likely at scale. The second and third de
 |               50 |                 71 % |
 |              100 |                 99 % |
 
-These numbers look alarming. At 50 pods you're almost guaranteed to have at least one duplicate node ID somewhere in the fleet.
+These numbers describe how often the first condition is satisfied. On its own, a duplicate node ID is harmless — it becomes a TSID collision only when the second and third conditions also hold.
 
-But this isn't the number that matters. It's just the first of three things that need to coincide.
+#### Step 2 — Write rate and TSID collision
 
-#### Step 2 — Given a duplicate, how often do collisions actually happen?
+Two pods sharing a node ID, each generating at rate *R* per second, hit the same millisecond with probability approximately `R² / 1000` per second.
 
-Two pods sharing a node ID, each generating at rate *R* per second, hit the same millisecond with probability roughly `R² / 1000` per second.
+Within that millisecond, the 12-bit counter provides 4,096 distinct values. The probability they also collide on counter is `1 / 4096`.
 
-Within that same millisecond, the 12-bit counter gives 4,096 different values. The chance they also pick the same counter is `1 / 4096`.
-
-Multiplying those gives the actual collision rate:
+Combined collision rate per pair of duplicate-node pods per second of concurrent generation:
 
 | Writes/sec per pod | Collisions per second | Mean time between collisions |
 | -----------------: | --------------------: | ---------------------------: |
-|                 10 |           2.4 × 10⁻⁵  |                    ~11.5 hr  |
+|                 10 |           2.4 × 10⁻⁵  |                    ~11.5 hr |
 |                100 |           2.4 × 10⁻³  |                    ~7 min   |
-|                500 |                  0.06 |                    ~16 sec   |
-|              1,000 |                  0.24 |                    ~4 sec    |
-|              5,000 |                   6.1 |                  continuous  |
+|                500 |                  0.06 |                    ~16 sec  |
+|              1,000 |                  0.24 |                    ~4 sec   |
+|              5,000 |                   6.1 |                  continuous |
 
-These rates are per *pair* of pods that share a node ID. Not across the whole fleet.
+These rates apply per pair of pods sharing a node ID, not across the entire fleet. At 10–100 writes per second per pod, the mean time between collisions is hours per duplicate-node pair. The database rejects the rare collision via the primary key constraint; the next `generate()` call advances the counter, so the retry produces a different ID.
 
-Realistic write rates for most microservices sit in the 10–100/sec range per pod. At those rates, a collision is a once-a-day event. Nowhere near anything that affects request latency.
+### Implementation: Deployment Manifest
 
-> **The whole pattern in one sentence.** Duplicate node IDs are likely. Duplicate TSIDs are rare. The database catches what slips through. The retry succeeds because the next `generate()` call advances the counter.
+The Kubernetes Downward API injects the pod UID and pod name into environment variables. No init containers, sidecars, additional volumes, or ServiceAccounts are required.
 
-### Example Implementation: Deployment Manifest
-
-The Kubernetes Downward API injects the pod UID and pod name into environment variables.
-
-No init containers. No sidecars. No extra volumes. No special ServiceAccounts.
-
-Here's a sample Helm chart - deployment template:
+The platform Helm chart already provides these. The relevant snippet from the deployment template:
 
 ```yaml
 env:
@@ -121,13 +115,15 @@ env:
     valueFrom:
       fieldRef:
         fieldPath: metadata.name
-  - name: CONTAINER_ID         # this is actually the pod UID
+  - name: CONTAINER_ID         # platform naming — value is the pod UID
     valueFrom:
       fieldRef:
         fieldPath: metadata.uid
 ```
 
-If you're writing the chart from scratch, the full Deployment looks like this:
+`CONTAINER_ID` is a platform naming convention; the underlying value is `metadata.uid` — the Kubernetes-assigned pod UID, not a container identifier.
+
+A complete Deployment manifest:
 
 ```yaml
 apiVersion: apps/v1
@@ -159,58 +155,48 @@ spec:
 public class TsidConfig {
 
     /**
-     * Creates the TSID factory used to generate primary keys for this service.
+     * Creates the TSID factory used to generate primary keys.
      *
-     * TSID is a 64-bit identifier with three parts:
-     *     [42-bit timestamp][10-bit node ID][12-bit counter]
+     * TSID layout: [42-bit timestamp][10-bit node ID][12-bit counter].
      *
-     * The node ID must be unique across pods writing to the same table at the
-     * same time. We get it by hashing the pod's UUID down into 10 bits (0–1023).
+     * The node ID must be unique across pods writing to the same table
+     * simultaneously. This implementation derives it by hashing the pod
+     * UUID down to 10 bits.
      *
-     * The two environment variables below come from the Kubernetes Downward API,
-     * configured in the Helm chart's deployment template. Kubernetes injects
-     * them into the container at pod startup.
+     * Both environment variables are injected by the Kubernetes Downward
+     * API, configured in the Helm chart deployment template.
      *
-     * @param podUid   Sourced from metadata.uid — the Kubernetes-assigned pod UUID.
-     *                 NOTE: the env var is named CONTAINER_ID in our platform's
-     *                 Helm chart, but the underlying value is actually the pod
-     *                 UID (the Kubernetes metadata.uid field), not a container ID.
-     *                 The name is a platform-team naming choice we've inherited.
-     * @param podName  Sourced from metadata.name — used only as a fallback if
-     *                 the pod UID is somehow missing.
+     * @param podUid   metadata.uid — the Kubernetes-assigned pod UUID.
+     *                 The environment variable is named CONTAINER_ID by
+     *                 platform convention; the underlying value is the
+     *                 pod UID, not a container identifier.
+     * @param podName  metadata.name — fallback if the pod UID is unavailable.
      */
     @Bean
     public TSID.Factory tsidFactory(
             @Value("${CONTAINER_ID:}") String podUid,
             @Value("${POD_NAME:}") String podName) {
 
-        // Prefer the pod UID. It's a full 128-bit UUID — plenty of entropy to
-        // hash into 10 bits without producing predictable collisions.
-        //
-        // The pod name (e.g. "orders-7d8c9bfb59-abc12") only varies in the
-        // 5-character suffix, giving roughly 14 bits of entropy. Usable as
-        // a fallback, but a worse hash source.
+        // The pod UID provides 128 bits of entropy. The pod name varies
+        // only in its 5-character suffix (~14 bits) and serves as a fallback.
         String source = !podUid.isBlank() ? podUid : podName;
 
-        // If both are missing, the Downward API isn't wired up correctly in
-        // the Helm chart. Fail fast at startup — generating IDs with a default
-        // node value would cause silent collisions across pods.
+        // Missing both env vars indicates a Downward API misconfiguration.
+        // Fail fast rather than generate IDs from a default node value.
         if (source.isBlank()) {
             throw new IllegalStateException(
                 "Neither CONTAINER_ID nor POD_NAME is set. " +
                 "Check the Downward API configuration in the Helm chart.");
         }
 
-        // Use Math.floorMod, not the % operator. Java's % can return a negative
-        // value when hashCode() returns a negative int — which happens routinely
-        // for UUID strings. A negative node ID would crash TSID.Factory.
-        // floorMod always returns a non-negative result for a positive divisor.
+        // hashCode() can return negative integers for UUID strings.
+        // Math.floorMod returns a non-negative result for a positive divisor;
+        // the % operator preserves the sign and would produce an invalid
+        // negative node ID.
         int nodeId = Math.floorMod(source.hashCode(), 1024);
 
         log.info("TSID node ID {} derived from pod identifier {}", nodeId, source);
 
-        // Build the TSID factory bound to this pod's node ID. The factory is
-        // thread-safe and used as a singleton across the application.
         return TSID.Factory.builder().withNode(nodeId).build();
     }
 }
@@ -218,13 +204,11 @@ public class TsidConfig {
 
 ### Implementation: Retry on Collision
 
-The retry is safe for three reasons.
+The retry is safe for three reasons:
 
-The insert is the first side effect of the operation. No partial state to clean up.
-
-Generating a new TSID takes microseconds.
-
-The next call to `generate()` advances the counter. The retry produces a different ID. The duplicate-key error doesn't come back.
+1. The insert is the first side effect of the operation. There is no partial state to roll back.
+2. TSID generation completes in microseconds.
+3. The next `generate()` call advances the counter, so the retry produces a different ID and the duplicate-key error does not recur.
 
 ```java
 @Repository
@@ -253,17 +237,17 @@ public class OrderRepository {
 }
 ```
 
-> **What to watch.** Emit `tsid.collision.retry` to your metrics system. At normal write volumes you'll see a handful of retries per day per service — that's healthy. If the rate climbs above roughly 1 per 10,000 inserts and stays there, something has changed. Treat it as a prompt to revisit node assignment, not as a routine page.
+> Emit `tsid.collision.retry` to a metrics system. A sustained rate above approximately 1 retry per 10,000 inserts indicates that write volume has increased substantially or the service has outgrown the pattern. Investigate node assignment in either case.
 
 ---
 
 ## StatefulSet Alternative
 
-If a service already runs as a StatefulSet, you get a much simpler answer.
+Services running as StatefulSets have a simpler option: use the pod ordinal directly.
 
-Kubernetes assigns stable, sequential ordinals to StatefulSet pods — `orders-0`, `orders-1`, and so on.
+Kubernetes assigns stable, sequential ordinals to StatefulSet pods — `orders-0`, `orders-1`, and so on. Each ordinal is unique within the StatefulSet and stable for the pod's lifetime.
 
-You can use that number directly as the node ID. Zero collision risk. No hashing. No retry needed.
+Using the ordinal as the node ID eliminates the need for hashing or retry.
 
 ```yaml
 env:
@@ -283,17 +267,17 @@ if (nodeId < 0 || nodeId > 1023) {
 TSID.Factory factory = TSID.Factory.builder().withNode(nodeId).build();
 ```
 
-Default StatefulSet ordinals work directly when they're in `0..1023`.
+Default StatefulSet ordinals work directly when they are within `[0, 1023]`.
 
-If `.spec.ordinals.start` is configured or if replicas can exceed 1024, map the ordinal into an assigned node range. Fail fast when the mapped value is outside `0..1023`.
+When `.spec.ordinals.start` is configured or replicas can exceed 1024, map the ordinal into an assigned node range. Validate the mapped value against `[0, 1023]` at startup.
 
-StatefulSets fit when a service has other reasons to need stable identity — persistent volumes attached to specific pods, ordered rollouts, sticky network identity. For those services, just use the ordinal directly.
+StatefulSets are appropriate when a service requires stable identity for other reasons — persistent volumes attached to specific pods, ordered rollouts, sticky network identity. The simpler node ID assignment is a secondary benefit, not a sufficient reason to adopt StatefulSets.
 
 ---
 
 ## What Not To Do: Static Environment Variable
 
-A single static env var assigned in the Deployment template is not a solution:
+A static environment variable in the Deployment template is not a valid solution:
 
 ```yaml
 env:
@@ -301,48 +285,48 @@ env:
     value: "7"
 ```
 
-Every replica in that Deployment would get node ID `7`. Every pod would share counter space. Duplicate IDs would be guaranteed under any concurrent write load.
+Every replica receives node ID `7`. All pods share counter space. Duplicate IDs are guaranteed under concurrent write load.
 
-The node ID assignment must vary per pod. It can't live in a static pod template field.
+Node ID assignment must vary per pod. It cannot be specified in a static field of the pod template.
 
 ---
 
 ## Other Coordinated Deployment Patterns
 
-For most services, pod UID hash + retry is sufficient. For services that need stricter guarantees — write rates in the thousands per second per pod, or shared global namespaces — coordinated assignment is the alternative.
+For most services, pod UID hash + retry is sufficient. Services with stricter requirements — sustained write rates in the thousands per second per pod, or shared global namespaces — require coordinated node assignment.
 
-Valid patterns that assign a distinct node ID per pod outside the static Deployment template:
+Valid coordinated patterns:
 
-- A platform controller injects `TSID_NODE` during pod creation and doesn't reuse it while the old pod can still generate IDs.
+- A platform controller injects `TSID_NODE` during pod creation and tracks live assignments to prevent reuse while an old pod can still generate IDs.
 - A mutating admission webhook assigns `TSID_NODE` from an approved range tracked against a 1,024-slot pool.
-- Multiple single-replica Deployments, each with an explicit, non-overlapping `TSID_NODE`.
+- Multiple single-replica Deployments, each with an explicit non-overlapping `TSID_NODE`.
 
-All three add infrastructure or operational overhead. They're appropriate when the write profile or namespace structure makes hash + retry inadequate.
+All three add infrastructure or operational overhead. They are appropriate when write profile or namespace structure makes hash + retry unsuitable.
 
-The constraint is the same as everywhere else: do not assign the same node ID to live pods that may write to the same destination at the same time.
+The constraint is the same as everywhere: live pods writing to the same destination must not share node IDs.
 
 ---
 
 ## Beyond 1024 Pods
 
-Beyond 1024 concurrent generators writing to the same destination, the 10-bit node field is exhausted.
+When more than 1024 concurrent generators write to the same destination, the 10-bit node field is exhausted.
 
-The fix is to create separate uniqueness domains whose keys include the tenant, service, or region shard. Each domain has its own 1,024-slot space.
+Partition the namespace by tenant, service, or region shard. Each partition has its own 1,024-slot space.
 
-Don't merge those domains later on TSID alone. If all IDs must share one global namespace and exceed 1024 concurrent writers, the 10-bit field is the limit.
+Partitions cannot be merged retroactively. When all IDs must occupy a single global namespace and concurrent writers exceed 1024, the 10-bit field is the upper limit.
 
 ---
 
 ## When to Use UUIDv7 Instead
 
-TSID with pod UID hash + retry fits most microservices. It doesn't fit everything.
+TSID with pod UID hash + retry is appropriate for most microservices. It is not appropriate for all.
 
-Reach for UUIDv7 when:
+Use UUIDv7 when:
 
-- The service sustains thousands of writes per second per pod, where the same-millisecond collision rate becomes visible in latency
-- The service runs in the hundreds of pods, where the birthday probability of duplicate node IDs approaches certainty even within one service
-- Node ID coordination — for any reason — isn't acceptable
+- The service sustains thousands of writes per second per pod, where same-millisecond collision rates become latency-visible
+- The service runs hundreds of pods, where the birthday probability of duplicate node IDs approaches certainty within a single service
+- Node ID coordination is unacceptable for organizational or operational reasons
 
-UUIDv7 has no node field and no coordination requirement. The tradeoff is 8 extra bytes per ID and partial sequencing (74 random bits within each millisecond) instead of strict sequencing.
+UUIDv7 has no node field and no coordination requirement. The tradeoffs are 8 additional bytes per ID and partial sequencing — 74 random bits within each millisecond instead of strict counter monotonicity.
 
-The decision is per service, not global. TSID where it fits, UUIDv7 where it doesn't.
+The decision is per service. TSID is appropriate where the math supports it; UUIDv7 is appropriate where it does not.
